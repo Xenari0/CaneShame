@@ -43,7 +43,7 @@ bool lastDownState = HIGH;
 // Entfernung und Pitch
 long duration;
 float distance;
-float angleThreshold = 70.0; // Max Pitch-Winkel in Grad
+float angleThreshold = 80.0; // Max Pitch-Winkel in Grad
 
 void setup() {
   pinMode(trigPin, OUTPUT);
