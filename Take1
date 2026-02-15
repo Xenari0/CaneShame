@@ -13,11 +13,22 @@
 MPU6050 gyro;
 
 // Pins
-const int trigPin = 9;
-const int echoPin = 10;
-const int buzzerPin = 3;
+// Arduino Nano Belegung:
+// D2  -> HC-SR04 TRIG
+// D4  -> HC-SR04 ECHO
+// D8  -> passiver Buzzer
+// D6  -> Button Lauter (INPUT_PULLUP)
+// D7  -> Button Leiser (INPUT_PULLUP)
+// A4/A5 -> I2C (SDA/SCL) für MPU6050
+const int trigPin = 2;
+const int echoPin = 4;
+const int buzzerPin = 8;
 const int buttonUp = 6;
 const int buttonDown = 7;
+
+// MPU6050 Pinbelegung am Arduino Nano (I2C)
+const int mpuSdaPin = A4;
+const int mpuSclPin = A5;
 
 // Sensor-Zeiten
 unsigned long previousMillis = 0;
@@ -44,6 +55,19 @@ bool lastDownState = HIGH;
 long duration;
 float distance;
 float angleThreshold = 80.0; // Max Pitch-Winkel in Grad
+float yAxisMuteAngle = 90.0; // Y-Achse Zielwinkel in Grad
+float yAxisMuteBuffer = 15.0; // +/- Grad Puffer
+
+// Passiver Buzzer (tone benötigt Frequenz statt PWM-Lautstärke)
+
+const int buzzerBaseFrequency = 1200; // Hz
+const int buzzerFrequencyStep = 4;    // Hz pro Volume-Schritt
+
+void writeVolumeToEeprom(int value) {
+  if (EEPROM.read(0) != value) {
+    EEPROM.write(0, value);
+  }
+}
 
 void setup() {
   pinMode(trigPin, OUTPUT);
@@ -73,7 +97,7 @@ void loop() {
 
   // Lautstärke-Feedback-Ton Ablaufprüfung
   if (volumeToneActive && currentMillis - volumeFeedbackStart >= volumeToneDuration) {
-    analogWrite(buzzerPin, 0);
+    noTone(buzzerPin);
     volumeToneActive = false;
   }
 
@@ -83,11 +107,15 @@ void loop() {
 
     readDistance();
     float pitch = getPitch();
+    float roll = getRoll();
 
-    if (distance <= 300 && abs(pitch) <= angleThreshold) {
-      analogWrite(buzzerPin, volume);
+    bool yAxisMuteActive = abs(roll) >= (yAxisMuteAngle - yAxisMuteBuffer)
+      && abs(roll) <= (yAxisMuteAngle + yAxisMuteBuffer);
+
+    if (!yAxisMuteActive && distance <= 300 && abs(pitch) <= angleThreshold) {
+      tone(buzzerPin, buzzerBaseFrequency + (volume * buzzerFrequencyStep));
     } else {
-      analogWrite(buzzerPin, 0);
+      noTone(buzzerPin);
     }
   }
 }
@@ -100,7 +128,7 @@ void handleButtons() {
   if (upState != lastUpState) {
     if (upState == LOW && (now - lastUpPress >= debounceTime)) {
       volume = min(volume + 5, maxVolume);
-      EEPROM.update(0, volume);
+      writeVolumeToEeprom(volume);
       triggerVolumeTone();
       lastUpPress = now;
     }
@@ -112,7 +140,7 @@ void handleButtons() {
   if (downState != lastDownState) {
     if (downState == LOW && (now - lastDownPress >= debounceTime)) {
       volume = max(volume - 5, minVolume);
-      EEPROM.update(0, volume);
+      writeVolumeToEeprom(volume);
       triggerVolumeTone();
       lastDownPress = now;
     }
@@ -121,7 +149,7 @@ void handleButtons() {
 }
 
 void triggerVolumeTone() {
-  analogWrite(buzzerPin, volume);
+  tone(buzzerPin, buzzerBaseFrequency + (volume * buzzerFrequencyStep));
   volumeToneActive = true;
   volumeFeedbackStart = millis();
 }
@@ -147,4 +175,16 @@ float getPitch() {
 
   float pitch = atan2(accX, sqrt(accY * accY + accZ * accZ)) * 180.0 / PI;
   return pitch;
+}
+
+float getRoll() {
+  int16_t ax, ay, az;
+  gyro.getAcceleration(&ax, &ay, &az);
+
+  float accX = ax / 16384.0;
+  float accY = ay / 16384.0;
+  float accZ = az / 16384.0;
+
+  float roll = atan2(accY, sqrt(accX * accX + accZ * accZ)) * 180.0 / PI;
+  return roll;
 }
