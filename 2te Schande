@@ -1,195 +1,188 @@
- //############################################
- // - HC-SR04 Abstandsprüfung
- // - Lautstärkeregler mit EEPROM
- // - Gyro (MPU6050) für Vorwärtsneigung
- // - PWM-Buzzer
- // - Non-blockierende Logik über millis()
- // - Feedbackton bei Lautstärkeänderung
- //############################################
- #include <Wire.h>
- #include <MPU6050.h>
- #include <EEPROM.h>
- 
- MPU6050 gyro;
- 
- // Pins
- const int trigPin = 9;
- const int echoPin = 10;
- const int buzzerPin = 3;
- // Arduino Nano Belegung:
- // D2  -> HC-SR04 TRIG
- // D4  -> HC-SR04 ECHO
- // D8  -> passiver Buzzer
- // D6  -> Button Lauter (INPUT_PULLUP)
- // D7  -> Button Leiser (INPUT_PULLUP)
- // A4/A5 -> I2C (SDA/SCL) für MPU6050
-  const int trigPin = 2;
-  const int echoPin = 4;
-  const int buzzerPin = 8;
-  const int buttonUp = 6;
-  const int buttonDown = 7;
- 
-  // Sensor-Zeiten
-  unsigned long previousMillis = 0;
-  const unsigned long sensorInterval = 100;
- 
- // Lautstärke
- int volume;
- const int maxVolume = 255;
- const int minVolume = 0;
- 
- // Feedback-Ton bei Volume-Change
- bool volumeToneActive = false;
- unsigned long volumeFeedbackStart = 0;
- const unsigned long volumeToneDuration = 100;
- 
- // Button-Debounce
- const unsigned long debounceTime = 150;
- unsigned long lastUpPress = 0;
- unsigned long lastDownPress = 0;
- bool lastUpState = HIGH;
- bool lastDownState = HIGH;
- 
- // Entfernung und Pitch
- long duration;
- float distance;
- float angleThreshold = 80.0; // Max Pitch-Winkel in Grad+float yAxisMuteAngle = 90.0; // Y-Achse Zielwinkel in Grad
- float yAxisMuteBuffer = 15.0; // +/- Grad Puffer
+#include <Wire.h>
+#include <avr/sleep.h>
 
- // Passiver Buzzer (tone benötigt Frequenz statt PWM-Lautstärke)
+// -------------------- Pinbelegung --------------------
+// HC-SR04
+const int TRIG_PIN   = 3;   // D3
+const int ECHO_PIN   = 4;   // D4
 
- const int buzzerBaseFrequency = 1200; // Hz
- const int buzzerFrequencyStep = 4;    // Hz pro Volume-Schritt
+// Buzzer
+const int BUZZER_PIN = 5;   // D5
 
- void writeVolumeToEeprom(int value) {
-  if (EEPROM.read(0) != value) {
-    EEPROM.write(0, value);
+// Ein/Aus Taster (Interruptfähig)
+const int BUTTON_PIN = 2;   // D2
+
+// -------------------- MPU-6050 Anschluss --------------------
+// VCC  -> 5V
+// GND  -> GND
+// SDA  -> A4
+// SCL  -> A5
+// INT  -> nicht genutzt
+
+const int MPU_ADDR = 0x68;
+
+// -------------------- Systemparameter --------------------
+const float SOUND_SPEED = 0.0343;        // cm/µs
+const int MAX_DISTANCE = 300;            // cm
+const int MIN_DISTANCE = 15;              // cm
+const float ANGLE_THRESHOLD = 80.0;      // Abschaltwinkel
+const unsigned long MEASURE_INTERVAL = 60; // ms
+
+// -------------------- Zustände --------------------
+bool systemActive = true;
+volatile bool wakeUpFlag = false;
+unsigned long lastMeasureTime = 0;
+
+// -------------------- Interrupt Service Routine --------------------
+void wakeUpISR() {
+  wakeUpFlag = true;
+}
+
+// -------------------- Setup --------------------
+void setup() {
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  Wire.begin();
+
+  // MPU-6050 aufwecken (Sleep-Register deaktivieren)
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission();
+
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), wakeUpISR, FALLING);
+
+  Serial.begin(9600);
+}
+
+// -------------------- Hauptschleife --------------------
+void loop() {
+
+  // Taster ausgelöst?
+  if (wakeUpFlag) {
+    wakeUpFlag = false;
+
+    bool previousState = systemActive;
+    systemActive = !systemActive;
+
+    delay(200);  // Entprellung
+
+    if (!previousState && systemActive) {
+      startupBeep();
+    }
+  }
+
+  // Wenn ausgeschaltet -> Sleep
+  if (!systemActive) {
+    enterSleep();
+    return;
+  }
+
+  // Zyklische Messung
+  if (millis() - lastMeasureTime >= MEASURE_INTERVAL) {
+
+    lastMeasureTime = millis();
+
+    float angle = calculateTiltAngle();
+
+    if (angle > ANGLE_THRESHOLD) {
+      digitalWrite(BUZZER_PIN, LOW);
+      return;
+    }
+
+    float distance = measureDistance();
+
+    if (distance >= MIN_DISTANCE && distance <= MAX_DISTANCE) {
+      handleBuzzer(distance);
+    } else {
+      digitalWrite(BUZZER_PIN, LOW);
+    }
   }
 }
- 
- void setup() {
-   pinMode(trigPin, OUTPUT);
-   pinMode(echoPin, INPUT);
-   pinMode(buzzerPin, OUTPUT);
-   pinMode(buttonUp, INPUT_PULLUP);
-   pinMode(buttonDown, INPUT_PULLUP);
- 
-   Serial.begin(9600);
-   Wire.begin();
-   gyro.initialize();
- 
-   if (!gyro.testConnection()) {
-     Serial.println("MPU6050 Verbindung fehlgeschlagen");
-     while (1);
-   }
- 
-   // EEPROM lesen
-   volume = EEPROM.read(0);
-   volume = constrain(volume, minVolume, maxVolume);
- }
- 
- void loop() {
-   handleButtons();
- 
-   unsigned long currentMillis = millis();
- 
-   // Lautstärke-Feedback-Ton Ablaufprüfung
-   if (volumeToneActive && currentMillis - volumeFeedbackStart >= volumeToneDuration) {
-    analogWrite(buzzerPin, 0);
-    noTone(buzzerPin);
-     volumeToneActive = false;
-   }
- 
-   // Nur wenn kein Feedback aktiv, Sensorlogik ausführen
-   if (!volumeToneActive && currentMillis - previousMillis >= sensorInterval) {
-     previousMillis = currentMillis;
- 
-     readDistance();
-     float pitch = getPitch();
-    float roll = getRoll();
 
-    bool yAxisMuteActive = abs(roll) >= (yAxisMuteAngle - yAxisMuteBuffer)
-      && abs(roll) <= (yAxisMuteAngle + yAxisMuteBuffer);
- 
-    if (distance <= 300 && abs(pitch) <= angleThreshold) {
-      analogWrite(buzzerPin, volume);
-    if (!yAxisMuteActive && distance <= 300 && abs(pitch) <= angleThreshold) {
-      tone(buzzerPin, buzzerBaseFrequency + (volume * buzzerFrequencyStep));
-     } else {
-      analogWrite(buzzerPin, 0);
-      noTone(buzzerPin);
-     }
-   }
- }
- 
- void handleButtons() {
-   unsigned long now = millis();
- 
-   // Up
-   bool upState = digitalRead(buttonUp);
-   if (upState != lastUpState) {
-     if (upState == LOW && (now - lastUpPress >= debounceTime)) {
-       volume = min(volume + 5, maxVolume);
-      EEPROM.update(0, volume);
-      writeVolumeToEeprom(volume);
-       triggerVolumeTone();
-       lastUpPress = now;
-     }
-     lastUpState = upState;
-   }
- 
-   // Down
-   bool downState = digitalRead(buttonDown);
-   if (downState != lastDownState) {
-     if (downState == LOW && (now - lastDownPress >= debounceTime)) {
-       volume = max(volume - 5, minVolume);
-      EEPROM.update(0, volume);
-      writeVolumeToEeprom(volume);
-       triggerVolumeTone();
-       lastDownPress = now;
-     }
-     lastDownState = downState;
-   }
- }
- 
- void triggerVolumeTone() {
-  analogWrite(buzzerPin, volume);
-  tone(buzzerPin, buzzerBaseFrequency + (volume * buzzerFrequencyStep));
-   volumeToneActive = true;
-   volumeFeedbackStart = millis();
- }
- 
- void readDistance() {
-   digitalWrite(trigPin, LOW);
-   delayMicroseconds(2);
-   digitalWrite(trigPin, HIGH);
-   delayMicroseconds(10);
-   digitalWrite(trigPin, LOW);
- 
-   duration = pulseIn(echoPin, HIGH);
-   distance = duration * 0.034 / 2; // cm
- }
- 
- float getPitch() {
-   int16_t ax, ay, az;
-   gyro.getAcceleration(&ax, &ay, &az);
- 
-   float accX = ax / 16384.0;
-   float accY = ay / 16384.0;
-   float accZ = az / 16384.0;
- 
-   float pitch = atan2(accX, sqrt(accY * accY + accZ * accZ)) * 180.0 / PI;
-   return pitch;
- }
+// -------------------- Sleep-Modus --------------------
+void enterSleep() {
 
-float getRoll() {
-  int16_t ax, ay, az;
-  gyro.getAcceleration(&ax, &ay, &az);
+  digitalWrite(BUZZER_PIN, LOW);
 
-  float accX = ax / 16384.0;
-  float accY = ay / 16384.0;
-  float accZ = az / 16384.0;
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  sleep_enable();
+  sleep_cpu();      
+  sleep_disable();
+}
 
-  float roll = atan2(accY, sqrt(accX * accX + accZ * accZ)) * 180.0 / PI;
-  return roll;
+// -------------------- Einschaltton --------------------
+void startupBeep() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(150);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// -------------------- Ultraschallmessung --------------------
+float measureDistance() {
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000); // Timeout 25ms
+
+  if (duration == 0) return -1;
+
+  return (duration * SOUND_SPEED) / 2.0;
+}
+
+// -------------------- Neigungsberechnung --------------------
+float calculateTiltAngle() {
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 6, true);
+
+  int16_t accX = Wire.read() << 8 | Wire.read();
+  int16_t accY = Wire.read() << 8 | Wire.read();
+  int16_t accZ = Wire.read() << 8 | Wire.read();
+
+  float ax = accX / 16384.0;
+  float ay = accY / 16384.0;
+  float az = accZ / 16384.0;
+
+  float angle = atan2(sqrt(ax * ax + ay * ay), az) * 180.0 / PI;
+
+  return angle;
+}
+
+// -------------------- Buzzersteuerung --------------------
+void handleBuzzer(float distance) {
+
+  unsigned long interval;
+
+  if (distance > 200) interval = 800;
+  else if (distance > 100) interval = 400;
+  else if (distance > 50) interval = 200;
+  else interval = 0;
+
+  if (interval == 0) {
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    static unsigned long lastBeep = 0;
+    static bool state = false;
+
+    if (millis() - lastBeep >= interval) {
+      lastBeep = millis();
+      state = !state;
+      digitalWrite(BUZZER_PIN, state);
+    }
+  }
 }
